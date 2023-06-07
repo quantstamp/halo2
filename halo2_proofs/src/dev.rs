@@ -81,12 +81,16 @@ impl Region {
 
 /// The value of a particular cell within the circuit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CellValue<F: Group + Field> {
+/// Visibility changed for analyzer
+pub enum CellValue<F: Group + Field> {
     // An unassigned cell.
+    /// Visibility changed for analyzer
     Unassigned,
     // A cell that has been assigned a value.
+    /// Visibility changed for analyzer
     Assigned(F),
     // A unique poisoned cell.
+    /// Visibility changed for analyzer
     Poison(usize),
 }
 
@@ -288,7 +292,8 @@ pub struct MockProver<F: Group + Field> {
     current_region: Option<Region>,
 
     // The fixed cells in the circuit, arranged as [column][row].
-    fixed: Vec<Vec<CellValue<F>>>,
+    /// Visibility changed for analyzer
+    pub fixed: Vec<Vec<CellValue<F>>>,
     // The advice cells in the circuit, arranged as [column][row].
     advice: Vec<Vec<CellValue<F>>>,
     // The instance cells in the circuit, arranged as [column][row].
