@@ -2,7 +2,7 @@
 
 use std::ops::Range;
 
-use ff::Field;
+use ff::{Field, FromUniformBytes};
 use group::Curve;
 
 use super::{
@@ -11,11 +11,12 @@ use super::{
         Selector,
     },
     evaluation::Evaluator,
-    permutation, Assigned, Error, Expression, LagrangeCoeff, Polynomial, ProvingKey, VerifyingKey,
+    permutation, Assigned, Challenge, Error, Expression, LagrangeCoeff, Polynomial, ProvingKey,
+    VerifyingKey,
 };
 use crate::{
     arithmetic::{parallelize, CurveAffine},
-    circuit::Value,
+    circuit::{layouter::SyncDeps, Value},
     poly::{
         batch_invert_assigned,
         commitment::{Blind, Params, MSM},
@@ -25,6 +26,7 @@ use crate::{
 
 pub(crate) fn create_domain<C, ConcreteCircuit>(
     k: u32,
+    #[cfg(feature = "circuit-params")] params: ConcreteCircuit::Params,
 ) -> (
     EvaluationDomain<C::Scalar>,
     ConstraintSystem<C::Scalar>,
@@ -35,6 +37,9 @@ where
     ConcreteCircuit: Circuit<C::Scalar>,
 {
     let mut cs = ConstraintSystem::default();
+    #[cfg(feature = "circuit-params")]
+    let config = ConcreteCircuit::configure_with_params(&mut cs, params);
+    #[cfg(not(feature = "circuit-params"))]
     let config = ConcreteCircuit::configure(&mut cs);
 
     let degree = cs.degree();
@@ -55,6 +60,8 @@ struct Assembly<F: Field> {
     usable_rows: Range<usize>,
     _marker: std::marker::PhantomData<F>,
 }
+
+impl<F: Field> SyncDeps for Assembly<F> {}
 
 impl<F: Field> Assignment<F> for Assembly<F> {
     fn enter_region<NR, N>(&mut self, _: N)
@@ -173,6 +180,18 @@ impl<F: Field> Assignment<F> for Assembly<F> {
         Ok(())
     }
 
+    fn get_challenge(&self, _: Challenge) -> Value<F> {
+        Value::unknown()
+    }
+
+    fn annotate_column<A, AR>(&mut self, _annotation: A, _column: Column<Any>)
+    where
+        A: FnOnce() -> AR,
+        AR: Into<String>,
+    {
+        // Do nothing
+    }
+
     fn push_namespace<NR, N>(&mut self, _: N)
     where
         NR: Into<String>,
@@ -195,8 +214,13 @@ where
     C: CurveAffine,
     P: Params<'params, C>,
     ConcreteCircuit: Circuit<C::Scalar>,
+    C::Scalar: FromUniformBytes<64>,
 {
-    let (domain, cs, config) = create_domain::<C, ConcreteCircuit>(params.k());
+    let (domain, cs, config) = create_domain::<C, ConcreteCircuit>(
+        params.k(),
+        #[cfg(feature = "circuit-params")]
+        circuit.params(),
+    );
 
     if (params.n() as usize) < cs.minimum_rows() {
         return Err(Error::not_enough_rows_available(params.k()));
@@ -220,7 +244,7 @@ where
     )?;
 
     let mut fixed = batch_invert_assigned(assembly.fixed);
-    let (cs, selector_polys) = cs.compress_selectors(assembly.selectors);
+    let (cs, selector_polys) = cs.compress_selectors(assembly.selectors.clone());
     fixed.extend(
         selector_polys
             .into_iter()
@@ -241,6 +265,7 @@ where
         fixed_commitments,
         permutation_vk,
         cs,
+        assembly.selectors,
     ))
 }
 
@@ -256,6 +281,9 @@ where
     ConcreteCircuit: Circuit<C::Scalar>,
 {
     let mut cs = ConstraintSystem::default();
+    #[cfg(feature = "circuit-params")]
+    let config = ConcreteCircuit::configure_with_params(&mut cs, circuit.params());
+    #[cfg(not(feature = "circuit-params"))]
     let config = ConcreteCircuit::configure(&mut cs);
 
     let cs = cs;
@@ -306,7 +334,7 @@ where
     // Compute l_0(X)
     // TODO: this can be done more efficiently
     let mut l0 = vk.domain.empty_lagrange();
-    l0[0] = C::Scalar::one();
+    l0[0] = C::Scalar::ONE;
     let l0 = vk.domain.lagrange_to_coeff(l0);
     let l0 = vk.domain.coeff_to_extended(l0);
 
@@ -314,7 +342,7 @@ where
     // and 0 otherwise over the domain.
     let mut l_blind = vk.domain.empty_lagrange();
     for evaluation in l_blind[..].iter_mut().rev().take(cs.blinding_factors()) {
-        *evaluation = C::Scalar::one();
+        *evaluation = C::Scalar::ONE;
     }
     let l_blind = vk.domain.lagrange_to_coeff(l_blind);
     let l_blind = vk.domain.coeff_to_extended(l_blind);
@@ -322,12 +350,12 @@ where
     // Compute l_last(X) which evaluates to 1 on the first inactive row (just
     // before the blinding factors) and 0 otherwise over the domain
     let mut l_last = vk.domain.empty_lagrange();
-    l_last[params.n() as usize - cs.blinding_factors() - 1] = C::Scalar::one();
+    l_last[params.n() as usize - cs.blinding_factors() - 1] = C::Scalar::ONE;
     let l_last = vk.domain.lagrange_to_coeff(l_last);
     let l_last = vk.domain.coeff_to_extended(l_last);
 
     // Compute l_active_row(X)
-    let one = C::Scalar::one();
+    let one = C::Scalar::ONE;
     let mut l_active_row = vk.domain.empty_extended();
     parallelize(&mut l_active_row, |values, start| {
         for (i, value) in values.iter_mut().enumerate() {

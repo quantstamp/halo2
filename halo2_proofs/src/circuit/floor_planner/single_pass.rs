@@ -7,12 +7,12 @@ use ff::Field;
 
 use crate::{
     circuit::{
-        layouter::{RegionColumn, RegionLayouter, RegionShape, TableLayouter},
+        layouter::{RegionColumn, RegionLayouter, RegionShape, SyncDeps, TableLayouter},
         Cell, Layouter, Region, RegionIndex, RegionStart, Table, Value,
     },
     plonk::{
-        Advice, Any, Assigned, Assignment, Circuit, Column, Error, Fixed, FloorPlanner, Instance,
-        Selector, TableColumn,
+        Advice, Any, Assigned, Assignment, Challenge, Circuit, Column, Error, Fixed, FloorPlanner,
+        Instance, Selector, TableColumn,
     },
 };
 
@@ -25,7 +25,7 @@ use crate::{
 pub struct SimpleFloorPlanner;
 
 impl FloorPlanner for SimpleFloorPlanner {
-    fn synthesize<F: Field, CS: Assignment<F>, C: Circuit<F>>(
+    fn synthesize<F: Field, CS: Assignment<F> + SyncDeps, C: Circuit<F>>(
         cs: &mut CS,
         circuit: &C,
         config: C::Config,
@@ -73,7 +73,9 @@ impl<'a, F: Field, CS: Assignment<F>> SingleChipLayouter<'a, F, CS> {
     }
 }
 
-impl<'a, F: Field, CS: Assignment<F> + 'a> Layouter<F> for SingleChipLayouter<'a, F, CS> {
+impl<'a, F: Field, CS: Assignment<F> + 'a + SyncDeps> Layouter<F>
+    for SingleChipLayouter<'a, F, CS>
+{
     type Root = Self;
 
     fn assign_region<A, AR, N, NR>(&mut self, name: N, mut assignment: A) -> Result<AR, Error>
@@ -214,6 +216,10 @@ impl<'a, F: Field, CS: Assignment<F> + 'a> Layouter<F> for SingleChipLayouter<'a
         )
     }
 
+    fn get_challenge(&self, challenge: Challenge) -> Value<F> {
+        self.cs.get_challenge(challenge)
+    }
+
     fn get_root(&mut self) -> &mut Self::Root {
         self
     }
@@ -259,7 +265,12 @@ impl<'r, 'a, F: Field, CS: Assignment<F> + 'a> SingleChipLayouterRegion<'r, 'a, 
     }
 }
 
-impl<'r, 'a, F: Field, CS: Assignment<F> + 'a> RegionLayouter<F>
+impl<'r, 'a, F: Field, CS: Assignment<F> + 'a + SyncDeps> SyncDeps
+    for SingleChipLayouterRegion<'r, 'a, F, CS>
+{
+}
+
+impl<'r, 'a, F: Field, CS: Assignment<F> + 'a + SyncDeps> RegionLayouter<F>
     for SingleChipLayouterRegion<'r, 'a, F, CS>
 {
     fn enable_selector<'v>(
@@ -273,6 +284,14 @@ impl<'r, 'a, F: Field, CS: Assignment<F> + 'a> RegionLayouter<F>
             selector,
             *self.layouter.regions[*self.region_index] + offset,
         )
+    }
+
+    fn name_column<'v>(
+        &'v mut self,
+        annotation: &'v (dyn Fn() -> String + 'v),
+        column: Column<Any>,
+    ) {
+        self.layouter.cs.annotate_column(annotation, column);
     }
 
     fn assign_advice<'v>(
@@ -467,6 +486,8 @@ mod tests {
         impl Circuit<vesta::Scalar> for MyCircuit {
             type Config = Column<Advice>;
             type FloorPlanner = SimpleFloorPlanner;
+            #[cfg(feature = "circuit-params")]
+            type Params = ();
 
             fn without_witnesses(&self) -> Self {
                 MyCircuit {}

@@ -4,9 +4,8 @@ use std::{convert::TryInto, fmt, marker::PhantomData};
 
 use ff::Field;
 
-use crate::{
-    arithmetic::FieldExt,
-    plonk::{Advice, Any, Assigned, Column, Error, Fixed, Instance, Selector, TableColumn},
+use crate::plonk::{
+    Advice, Any, Assigned, Challenge, Column, Error, Fixed, Instance, Selector, TableColumn,
 };
 
 mod value;
@@ -25,7 +24,7 @@ pub mod layouter;
 /// The chip also loads any fixed configuration needed at synthesis time
 /// using its own implementation of `load`, and stores it in [`Chip::Loaded`].
 /// This can be accessed via [`Chip::loaded`].
-pub trait Chip<F: FieldExt>: Sized {
+pub trait Chip<F: Field>: Sized {
     /// A type that holds the configuration for this chip, and any other state it may need
     /// during circuit synthesis, that can be derived during [`Circuit::configure`].
     ///
@@ -202,6 +201,20 @@ impl<'r, F: Field> Region<'r, F> {
     {
         self.region
             .enable_selector(&|| annotation().into(), selector, offset)
+    }
+
+    /// Allows the circuit implementor to name/annotate a Column within a Region context.
+    ///
+    /// This is useful in order to improve the amount of information that `prover.verify()`
+    /// and `prover.assert_satisfied()` can provide.
+    pub fn name_column<A, AR, T>(&mut self, annotation: A, column: T)
+    where
+        A: Fn() -> AR,
+        AR: Into<String>,
+        T: Into<Column<Any>>,
+    {
+        self.region
+            .name_column(&|| annotation().into(), column.into());
     }
 
     /// Assign an advice column value (witness).
@@ -441,6 +454,11 @@ pub trait Layouter<F: Field> {
         row: usize,
     ) -> Result<(), Error>;
 
+    /// Queries the value of the given challenge.
+    ///
+    /// Returns `Value::unknown()` if the current synthesis phase is before the challenge can be queried.
+    fn get_challenge(&self, challenge: Challenge) -> Value<F>;
+
     /// Gets the "root" of this assignment, bypassing the namespacing.
     ///
     /// Not intended for downstream consumption; use [`Layouter::namespace`] instead.
@@ -504,6 +522,10 @@ impl<'a, F: Field, L: Layouter<F> + 'a> Layouter<F> for NamespacedLayouter<'a, F
         row: usize,
     ) -> Result<(), Error> {
         self.0.constrain_instance(cell, column, row)
+    }
+
+    fn get_challenge(&self, challenge: Challenge) -> Value<F> {
+        self.0.get_challenge(challenge)
     }
 
     fn get_root(&mut self) -> &mut Self::Root {

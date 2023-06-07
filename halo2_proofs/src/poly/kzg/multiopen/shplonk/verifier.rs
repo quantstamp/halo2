@@ -5,8 +5,8 @@ use super::ChallengeY;
 use super::{construct_intermediate_sets, ChallengeU, ChallengeV};
 use crate::arithmetic::{
     eval_polynomial, evaluate_vanishing_polynomial, lagrange_interpolate, powers, CurveAffine,
-    FieldExt,
 };
+use crate::helpers::SerdeCurveAffine;
 use crate::poly::commitment::Verifier;
 use crate::poly::commitment::MSM;
 use crate::poly::kzg::commitment::{KZGCommitmentScheme, ParamsKZG};
@@ -21,7 +21,7 @@ use crate::poly::{
     Error,
 };
 use crate::transcript::{EncodedChallenge, TranscriptRead};
-use ff::Field;
+use ff::{Field, PrimeField};
 use group::Group;
 use halo2curves::pairing::{Engine, MillerLoopResult, MultiMillerLoop};
 use rand_core::OsRng;
@@ -33,11 +33,17 @@ pub struct VerifierSHPLONK<'params, E: Engine> {
     params: &'params ParamsKZG<E>,
 }
 
-impl<'params, E: MultiMillerLoop + Debug> Verifier<'params, KZGCommitmentScheme<E>>
-    for VerifierSHPLONK<'params, E>
+impl<'params, E> Verifier<'params, KZGCommitmentScheme<E>> for VerifierSHPLONK<'params, E>
+where
+    E: MultiMillerLoop + Debug,
+    E::Scalar: PrimeField + Ord,
+    E::G1Affine: SerdeCurveAffine,
+    E::G2Affine: SerdeCurveAffine,
 {
     type Guard = GuardKZG<'params, E>;
     type MSMAccumulator = DualMSM<'params, E>;
+
+    const QUERY_INSTANCE: bool = false;
 
     fn new(params: &'params ParamsKZG<E>) -> Self {
         Self { params }
@@ -71,8 +77,8 @@ impl<'params, E: MultiMillerLoop + Debug> Verifier<'params, KZGCommitmentScheme<
         let u: ChallengeU<_> = transcript.squeeze_challenge_scalar();
         let h2 = transcript.read_point().map_err(|_| Error::SamplingError)?;
 
-        let (mut z_0_diff_inverse, mut z_0) = (E::Scalar::zero(), E::Scalar::zero());
-        let (mut outer_msm, mut r_outer_acc) = (PreMSM::<E>::new(), E::Scalar::zero());
+        let (mut z_0_diff_inverse, mut z_0) = (E::Scalar::ZERO, E::Scalar::ZERO);
+        let (mut outer_msm, mut r_outer_acc) = (PreMSM::<E>::new(), E::Scalar::ZERO);
         for (i, (rotation_set, power_of_v)) in rotation_sets.iter().zip(powers(*v)).enumerate() {
             let diffs: Vec<E::Scalar> = super_point_set
                 .iter()
@@ -85,7 +91,7 @@ impl<'params, E: MultiMillerLoop + Debug> Verifier<'params, KZGCommitmentScheme<
             if i == 0 {
                 z_0 = evaluate_vanishing_polynomial(&rotation_set.points[..], *u);
                 z_0_diff_inverse = z_diff_i.invert().unwrap();
-                z_diff_i = E::Scalar::one();
+                z_diff_i = E::Scalar::ONE;
             } else {
                 z_diff_i.mul_assign(z_0_diff_inverse);
             }
@@ -131,9 +137,7 @@ impl<'params, E: MultiMillerLoop + Debug> Verifier<'params, KZGCommitmentScheme<
         outer_msm.append_term(-z_0, h1.into());
         outer_msm.append_term(*u, h2.into());
 
-        msm_accumulator
-            .left
-            .append_term(E::Scalar::one(), h2.into());
+        msm_accumulator.left.append_term(E::Scalar::ONE, h2.into());
 
         msm_accumulator.right.add_msm(&outer_msm);
 

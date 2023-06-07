@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod test {
-    use crate::arithmetic::{eval_polynomial, FieldExt};
+    use crate::arithmetic::eval_polynomial;
     use crate::plonk::Error;
     use crate::poly::commitment::ParamsProver;
     use crate::poly::commitment::{Blind, ParamsVerifier, MSM};
@@ -13,10 +13,11 @@ mod test {
     };
     use crate::poly::{Coeff, Polynomial};
     use crate::transcript::{
-        self, Blake2bRead, Blake2bWrite, Challenge255, EncodedChallenge, TranscriptRead,
-        TranscriptReadBuffer, TranscriptWrite, TranscriptWriterBuffer,
+        self, Blake2bRead, Blake2bWrite, Challenge255, EncodedChallenge, Keccak256Read,
+        Keccak256Write, TranscriptRead, TranscriptReadBuffer, TranscriptWrite,
+        TranscriptWriterBuffer,
     };
-    use ff::Field;
+    use ff::{Field, PrimeField, WithSmallOrderMulGroup};
     use group::{Curve, Group};
     use halo2curves::CurveAffine;
     use rand_core::{OsRng, RngCore};
@@ -55,6 +56,43 @@ mod test {
             VerifierIPA<_>,
             _,
             Blake2bRead<_, _, Challenge255<_>>,
+            AccumulatorStrategy<_>,
+        >(verifier_params, &proof[..], true);
+    }
+
+    #[test]
+    fn test_roundtrip_ipa_keccak() {
+        use crate::poly::ipa::commitment::{IPACommitmentScheme, ParamsIPA};
+        use crate::poly::ipa::multiopen::{ProverIPA, VerifierIPA};
+        use crate::poly::ipa::strategy::AccumulatorStrategy;
+        use halo2curves::pasta::{Ep, EqAffine, Fp};
+
+        const K: u32 = 4;
+
+        let params = ParamsIPA::<EqAffine>::new(K);
+
+        let proof = create_proof::<
+            IPACommitmentScheme<EqAffine>,
+            ProverIPA<_>,
+            _,
+            Keccak256Write<_, _, Challenge255<_>>,
+        >(&params);
+
+        let verifier_params = params.verifier_params();
+
+        verify::<
+            IPACommitmentScheme<EqAffine>,
+            VerifierIPA<_>,
+            _,
+            Keccak256Read<_, _, Challenge255<_>>,
+            AccumulatorStrategy<_>,
+        >(verifier_params, &proof[..], false);
+
+        verify::<
+            IPACommitmentScheme<EqAffine>,
+            VerifierIPA<_>,
+            _,
+            Keccak256Read<_, _, Challenge255<_>>,
             AccumulatorStrategy<_>,
         >(verifier_params, &proof[..], true);
     }
@@ -195,28 +233,25 @@ mod test {
         T: TranscriptWriterBuffer<Vec<u8>, Scheme::Curve, E>,
     >(
         params: &'params Scheme::ParamsProver,
-    ) -> Vec<u8> {
+    ) -> Vec<u8>
+    where
+        Scheme::Scalar: WithSmallOrderMulGroup<3>,
+    {
         let domain = EvaluationDomain::new(1, params.k());
 
         let mut ax = domain.empty_coeff();
         for (i, a) in ax.iter_mut().enumerate() {
-            *a = <<Scheme as CommitmentScheme>::Curve as CurveAffine>::ScalarExt::from(
-                10 + i as u64,
-            );
+            *a = <<Scheme as CommitmentScheme>::Scalar>::from(10 + i as u64);
         }
 
         let mut bx = domain.empty_coeff();
         for (i, a) in bx.iter_mut().enumerate() {
-            *a = <<Scheme as CommitmentScheme>::Curve as CurveAffine>::ScalarExt::from(
-                100 + i as u64,
-            );
+            *a = <<Scheme as CommitmentScheme>::Scalar>::from(100 + i as u64);
         }
 
         let mut cx = domain.empty_coeff();
         for (i, a) in cx.iter_mut().enumerate() {
-            *a = <<Scheme as CommitmentScheme>::Curve as CurveAffine>::ScalarExt::from(
-                100 + i as u64,
-            );
+            *a = <<Scheme as CommitmentScheme>::Scalar>::from(100 + i as u64);
         }
 
         let mut transcript = T::init(vec![]);

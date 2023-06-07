@@ -10,8 +10,8 @@ use std::ops::Range;
 use crate::{
     circuit::{layouter::RegionColumn, Value},
     plonk::{
-        Advice, Any, Assigned, Assignment, Circuit, Column, ConstraintSystem, Error, Fixed,
-        FloorPlanner, Instance, Selector,
+        Advice, Any, Assigned, Assignment, Challenge, Circuit, Column, ConstraintSystem, Error,
+        Fixed, FloorPlanner, Instance, Selector,
     },
 };
 
@@ -97,6 +97,9 @@ impl CircuitLayout {
         let n = 1 << k;
         // Collect the layout details.
         let mut cs = ConstraintSystem::default();
+        #[cfg(feature = "circuit-params")]
+        let config = ConcreteCircuit::configure_with_params(&mut cs, circuit.params());
+        #[cfg(not(feature = "circuit-params"))]
         let config = ConcreteCircuit::configure(&mut cs);
         let mut layout = Layout::new(k, n, cs.num_selectors);
         ConcreteCircuit::FloorPlanner::synthesize(
@@ -120,7 +123,7 @@ impl CircuitLayout {
             column.index()
                 + match column.column_type() {
                     Any::Instance => 0,
-                    Any::Advice => cs.num_instance_columns,
+                    Any::Advice(_) => cs.num_instance_columns,
                     Any::Fixed => cs.num_instance_columns + cs.num_advice_columns,
                 }
         };
@@ -352,6 +355,8 @@ struct Layout {
     selectors: Vec<Vec<bool>>,
 }
 
+impl crate::dev::SyncDeps for Layout {}
+
 impl Layout {
     fn new(k: u32, n: usize, num_selectors: usize) -> Self {
         Layout {
@@ -488,6 +493,18 @@ impl<F: Field> Assignment<F> for Layout {
         _: Value<Assigned<F>>,
     ) -> Result<(), Error> {
         Ok(())
+    }
+
+    fn get_challenge(&self, _: Challenge) -> Value<F> {
+        Value::unknown()
+    }
+
+    fn annotate_column<A, AR>(&mut self, _annotation: A, _column: Column<Any>)
+    where
+        A: FnOnce() -> AR,
+        AR: Into<String>,
+    {
+        // Do nothing
     }
 
     fn push_namespace<NR, N>(&mut self, _: N)

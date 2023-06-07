@@ -3,9 +3,9 @@ use super::{
 };
 use crate::arithmetic::{
     eval_polynomial, evaluate_vanishing_polynomial, kate_division, lagrange_interpolate,
-    parallelize, powers, CurveAffine, FieldExt,
+    parallelize, powers, CurveAffine,
 };
-
+use crate::helpers::SerdeCurveAffine;
 use crate::poly::commitment::{Blind, ParamsProver, Prover};
 use crate::poly::kzg::commitment::{KZGCommitmentScheme, ParamsKZG};
 use crate::poly::query::{PolynomialPointer, ProverQuery};
@@ -13,16 +13,17 @@ use crate::poly::Rotation;
 use crate::poly::{commitment::Params, Coeff, Polynomial};
 use crate::transcript::{EncodedChallenge, TranscriptWrite};
 
-use ff::Field;
+use ff::{Field, PrimeField};
 use group::Curve;
 use halo2curves::pairing::Engine;
 use rand_core::RngCore;
+use rayon::prelude::*;
 use std::fmt::Debug;
 use std::io::{self, Write};
 use std::marker::PhantomData;
 use std::ops::MulAssign;
 
-fn div_by_vanishing<F: FieldExt>(poly: Polynomial<F, Coeff>, roots: &[F]) -> Vec<F> {
+fn div_by_vanishing<F: Field>(poly: Polynomial<F, Coeff>, roots: &[F]) -> Vec<F> {
     let poly = roots
         .iter()
         .fold(poly.values, |poly, point| kate_division(&poly, *point));
@@ -36,8 +37,8 @@ struct CommitmentExtension<'a, C: CurveAffine> {
 }
 
 impl<'a, C: CurveAffine> Commitment<C::Scalar, PolynomialPointer<'a, C>> {
-    fn extend(&self, points: Vec<C::Scalar>) -> CommitmentExtension<'a, C> {
-        let poly = lagrange_interpolate(&points[..], &self.evals()[..]);
+    fn extend(&self, points: &[C::Scalar]) -> CommitmentExtension<'a, C> {
+        let poly = lagrange_interpolate(points, &self.evals()[..]);
 
         let low_degree_equivalent = Polynomial {
             values: poly,
@@ -79,10 +80,10 @@ struct RotationSetExtension<'a, C: CurveAffine> {
 }
 
 impl<'a, C: CurveAffine> RotationSet<C::Scalar, PolynomialPointer<'a, C>> {
-    fn extend(&self, commitments: Vec<CommitmentExtension<'a, C>>) -> RotationSetExtension<'a, C> {
+    fn extend(self, commitments: Vec<CommitmentExtension<'a, C>>) -> RotationSetExtension<'a, C> {
         RotationSetExtension {
             commitments,
-            points: self.points.clone(),
+            points: self.points,
         }
     }
 }
@@ -103,7 +104,13 @@ impl<'a, E: Engine> ProverSHPLONK<'a, E> {
 /// Create a multi-opening proof
 impl<'params, E: Engine + Debug> Prover<'params, KZGCommitmentScheme<E>>
     for ProverSHPLONK<'params, E>
+where
+    E::Scalar: Ord + PrimeField,
+    E::G1Affine: SerdeCurveAffine,
+    E::G2Affine: SerdeCurveAffine,
 {
+    const QUERY_INSTANCE: bool = false;
+
     fn new(params: &'params ParamsKZG<E>) -> Self {
         Self { params }
     }
@@ -134,8 +141,9 @@ impl<'params, E: Engine + Debug> Prover<'params, KZGCommitmentScheme<E>>
                 // [P_i_0(X) - R_i_0(X), P_i_1(X) - R_i_1(X), ... ]
                 let numerators = rotation_set
                     .commitments
-                    .iter()
-                    .map(|commitment| commitment.quotient_contribution());
+                    .par_iter()
+                    .map(|commitment| commitment.quotient_contribution())
+                    .collect::<Vec<_>>();
 
                 // define numerator polynomial as
                 // N_i_j(X) = (P_i_j(X) - R_i_j(X))
@@ -143,6 +151,7 @@ impl<'params, E: Engine + Debug> Prover<'params, KZGCommitmentScheme<E>>
                 // N_i(X) = linear_combinination(y, N_i_j(X))
                 // where y is random scalar to combine numerator polynomials
                 let n_x = numerators
+                    .into_iter()
                     .zip(powers(*y))
                     .map(|(numerator, power_of_y)| numerator * power_of_y)
                     .reduce(|acc, numerator| acc + &numerator)
@@ -154,7 +163,7 @@ impl<'params, E: Engine + Debug> Prover<'params, KZGCommitmentScheme<E>>
                 // Q_i(X) = N_i(X) / Z_i(X) where
                 // Z_i(X) = (x - r_i_0) * (x - r_i_1) * ...
                 let mut poly = div_by_vanishing(n_x, points);
-                poly.resize(self.params.n as usize, E::Scalar::zero());
+                poly.resize(self.params.n as usize, E::Scalar::ZERO);
 
                 Polynomial {
                     values: poly,
@@ -169,12 +178,12 @@ impl<'params, E: Engine + Debug> Prover<'params, KZGCommitmentScheme<E>>
         );
 
         let rotation_sets: Vec<RotationSetExtension<E::G1Affine>> = rotation_sets
-            .iter()
+            .into_par_iter()
             .map(|rotation_set| {
                 let commitments: Vec<CommitmentExtension<E::G1Affine>> = rotation_set
                     .commitments
-                    .iter()
-                    .map(|commitment_data| commitment_data.extend(rotation_set.points.clone()))
+                    .par_iter()
+                    .map(|commitment_data| commitment_data.extend(&rotation_set.points))
                     .collect();
                 rotation_set.extend(commitments)
             })
@@ -182,9 +191,13 @@ impl<'params, E: Engine + Debug> Prover<'params, KZGCommitmentScheme<E>>
 
         let v: ChallengeV<_> = transcript.squeeze_challenge_scalar();
 
-        let quotient_polynomials = rotation_sets.iter().map(quotient_contribution);
+        let quotient_polynomials = rotation_sets
+            .par_iter()
+            .map(quotient_contribution)
+            .collect::<Vec<_>>();
 
         let h_x: Polynomial<E::Scalar, Coeff> = quotient_polynomials
+            .into_iter()
             .zip(powers(*v))
             .map(|(poly, power_of_v)| poly * power_of_v)
             .reduce(|acc, poly| acc + &poly)
@@ -194,18 +207,15 @@ impl<'params, E: Engine + Debug> Prover<'params, KZGCommitmentScheme<E>>
         transcript.write_point(h)?;
         let u: ChallengeU<_> = transcript.squeeze_challenge_scalar();
 
-        let zt_eval = evaluate_vanishing_polynomial(&super_point_set[..], *u);
-
         let linearisation_contribution =
             |rotation_set: RotationSetExtension<E::G1Affine>| -> (Polynomial<E::Scalar, Coeff>, E::Scalar) {
-                let diffs: Vec<E::Scalar> = super_point_set
-                    .iter()
-                    .filter(|point| !rotation_set.points.contains(point))
-                    .copied()
-                    .collect();
+                let mut diffs = super_point_set.clone();
+                for point in rotation_set.points.iter() {
+                    diffs.remove(point);
+                }
+                let diffs = diffs.into_iter().collect::<Vec<_>>();
 
                 // calculate difference vanishing polynomial evaluation
-
                 let z_i = evaluate_vanishing_polynomial(&diffs[..], *u);
 
                 // inner linearisation contibutions are
@@ -214,15 +224,15 @@ impl<'params, E: Engine + Debug> Prover<'params, KZGCommitmentScheme<E>>
                 // where u is random evaluation point
                 let inner_contributions = rotation_set
                     .commitments
-                    .iter()
-                    .map(|commitment| commitment.linearisation_contribution(*u));
+                    .par_iter()
+                    .map(|commitment| commitment.linearisation_contribution(*u)).collect::<Vec<_>>();
 
                 // define inner contributor polynomial as
                 // L_i_j(X) = (P_i_j(X) - r_i_j)
                 // and combine polynomials with same evaluation point set
                 // L_i(X) = linear_combinination(y, L_i_j(X))
                 // where y is random scalar to combine inner contibutors
-                let l_x: Polynomial<E::Scalar, Coeff> = inner_contributions.zip(powers(*y)).map(|(poly, power_of_y)| poly * power_of_y).reduce(|acc, poly| acc + &poly).unwrap();
+                let l_x: Polynomial<E::Scalar, Coeff> = inner_contributions.into_iter().zip(powers(*y)).map(|(poly, power_of_y)| poly * power_of_y).reduce(|acc, poly| acc + &poly).unwrap();
 
                 // finally scale l_x by difference vanishing polynomial evaluation z_i
                 (l_x * z_i, z_i)
@@ -233,7 +243,7 @@ impl<'params, E: Engine + Debug> Prover<'params, KZGCommitmentScheme<E>>
             Vec<Polynomial<E::Scalar, Coeff>>,
             Vec<E::Scalar>,
         ) = rotation_sets
-            .into_iter()
+            .into_par_iter()
             .map(linearisation_contribution)
             .unzip();
 
@@ -244,12 +254,15 @@ impl<'params, E: Engine + Debug> Prover<'params, KZGCommitmentScheme<E>>
             .reduce(|acc, poly| acc + &poly)
             .unwrap();
 
+        let super_point_set = super_point_set.into_iter().collect::<Vec<_>>();
+        let zt_eval = evaluate_vanishing_polynomial(&super_point_set[..], *u);
         let l_x = l_x - &(h_x * zt_eval);
 
         // sanity check
+        #[cfg(debug_assertions)]
         {
             let must_be_zero = eval_polynomial(&l_x.values[..], *u);
-            assert_eq!(must_be_zero, E::Scalar::zero());
+            assert_eq!(must_be_zero, E::Scalar::ZERO);
         }
 
         let mut h_x = div_by_vanishing(l_x, &[*u]);

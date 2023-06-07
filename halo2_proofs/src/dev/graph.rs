@@ -4,8 +4,8 @@ use tabbycat::{AttrList, Edge, GraphBuilder, GraphType, Identity, StmtList};
 use crate::{
     circuit::Value,
     plonk::{
-        Advice, Any, Assigned, Assignment, Circuit, Column, ConstraintSystem, Error, Fixed,
-        FloorPlanner, Instance, Selector,
+        Advice, Any, Assigned, Assignment, Challenge, Circuit, Column, ConstraintSystem, Error,
+        Fixed, FloorPlanner, Instance, Selector,
     },
 };
 
@@ -22,6 +22,9 @@ pub fn circuit_dot_graph<F: Field, ConcreteCircuit: Circuit<F>>(
 ) -> String {
     // Collect the graph details.
     let mut cs = ConstraintSystem::default();
+    #[cfg(feature = "circuit-params")]
+    let config = ConcreteCircuit::configure_with_params(&mut cs, circuit.params());
+    #[cfg(not(feature = "circuit-params"))]
     let config = ConcreteCircuit::configure(&mut cs);
     let mut graph = Graph::default();
     ConcreteCircuit::FloorPlanner::synthesize(&mut graph, circuit, config, cs.constants).unwrap();
@@ -77,6 +80,8 @@ struct Graph {
     current_namespace: Vec<usize>,
 }
 
+impl crate::dev::SyncDeps for Graph {}
+
 impl<F: Field> Assignment<F> for Graph {
     fn enter_region<NR, N>(&mut self, _: N)
     where
@@ -97,6 +102,14 @@ impl<F: Field> Assignment<F> for Graph {
     {
         // Do nothing; we don't care about cells in this context.
         Ok(())
+    }
+
+    fn annotate_column<A, AR>(&mut self, _annotation: A, _column: Column<Any>)
+    where
+        A: FnOnce() -> AR,
+        AR: Into<String>,
+    {
+        // Do nothing
     }
 
     fn query_instance(&self, _: Column<Instance>, _: usize) -> Result<Value<F>, Error> {
@@ -155,6 +168,10 @@ impl<F: Field> Assignment<F> for Graph {
         _: Value<Assigned<F>>,
     ) -> Result<(), Error> {
         Ok(())
+    }
+
+    fn get_challenge(&self, _: Challenge) -> Value<F> {
+        Value::unknown()
     }
 
     fn push_namespace<NR, N>(&mut self, name_fn: N)

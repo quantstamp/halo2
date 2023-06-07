@@ -209,6 +209,7 @@ impl<Fixed: FixedPoints<pallas::Affine>> Config<Fixed> {
         // tested at the circuit-level.
         {
             use super::super::FixedPoint;
+            use ff::Field;
             use group::{ff::PrimeField, Curve};
 
             scalar
@@ -228,9 +229,9 @@ impl<Fixed: FixedPoints<pallas::Affine>> Config<Fixed> {
                             let magnitude = pallas::Scalar::from_repr(magnitude.to_repr()).unwrap();
 
                             let sign = if sign == &&pallas::Base::one() {
-                                pallas::Scalar::one()
+                                pallas::Scalar::ONE
                             } else {
-                                -pallas::Scalar::one()
+                                -pallas::Scalar::ONE
                             };
 
                             magnitude * sign
@@ -248,13 +249,16 @@ impl<Fixed: FixedPoints<pallas::Affine>> Config<Fixed> {
 
 #[cfg(test)]
 pub mod tests {
-    use group::{ff::PrimeField, Curve};
+    use group::{
+        ff::{Field, PrimeField},
+        Curve,
+    };
     use halo2_proofs::{
         arithmetic::CurveAffine,
         circuit::{AssignedCell, Chip, Layouter, Value},
         plonk::{Any, Error},
     };
-    use halo2curves::{pasta::pallas, FieldExt};
+    use halo2curves::pasta::pallas;
 
     use crate::{
         ecc::{
@@ -359,9 +363,9 @@ pub mod tests {
             let scalar = {
                 let magnitude = pallas::Scalar::from_repr(magnitude.to_repr()).unwrap();
                 let sign = if *sign == pallas::Base::one() {
-                    pallas::Scalar::one()
+                    pallas::Scalar::ONE
                 } else {
-                    -pallas::Scalar::one()
+                    -pallas::Scalar::ONE
                 };
                 magnitude * sign
             };
@@ -430,6 +434,8 @@ pub mod tests {
         impl Circuit<pallas::Base> for MyCircuit {
             type Config = EccConfig<TestFixedBases>;
             type FloorPlanner = SimpleFloorPlanner;
+            #[cfg(feature = "circuit-params")]
+            type Params = ();
 
             fn without_witnesses(&self) -> Self {
                 Self::default()
@@ -580,7 +586,7 @@ pub mod tests {
                                     offset: 1,
                                 },
                                 cell_values: vec![(
-                                    ((Any::Advice, 5).into(), 0).into(),
+                                    ((Any::advice(), 5).into(), 0).into(),
                                     format_value(*magnitude_error),
                                 )],
                             },
@@ -589,7 +595,7 @@ pub mod tests {
                                 location: FailureLocation::OutsideRegion { row: 0 },
                             },
                             VerifyFailure::Permutation {
-                                column: (Any::Advice, 4).into(),
+                                column: (Any::advice(), 4).into(),
                                 location: FailureLocation::InRegion {
                                     region: (2, "Short fixed-base mul (incomplete addition)")
                                         .into(),
@@ -631,7 +637,7 @@ pub mod tests {
                             region: (3, "Short fixed-base mul (most significant word)").into(),
                             offset: 1,
                         },
-                        cell_values: vec![(((Any::Advice, 4).into(), 0).into(), "0".to_string())],
+                        cell_values: vec![(((Any::advice(), 4).into(), 0).into(), "0".to_string())],
                     },
                     VerifyFailure::ConstraintNotSatisfied {
                         constraint: (
@@ -646,14 +652,14 @@ pub mod tests {
                         },
                         cell_values: vec![
                             (
-                                ((Any::Advice, 1).into(), 0).into(),
+                                ((Any::advice(), 1).into(), 0).into(),
                                 format_value(negation_check_y),
                             ),
                             (
-                                ((Any::Advice, 3).into(), 0).into(),
+                                ((Any::advice(), 3).into(), 0).into(),
                                 format_value(negation_check_y),
                             ),
-                            (((Any::Advice, 4).into(), 0).into(), "0".to_string()),
+                            (((Any::advice(), 4).into(), 0).into(), "0".to_string()),
                         ],
                     }
                 ])

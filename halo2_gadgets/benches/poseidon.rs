@@ -3,23 +3,8 @@ use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
     plonk::{
         create_proof, keygen_pk, keygen_vk, verify_proof, Advice, Circuit, Column,
-        ConstraintSystem, Error,
+        ConstraintSystem, Error, Instance,
     },
-    transcript::{Blake2bRead, Blake2bWrite, Challenge255},
-};
-use halo2curves::pasta::{pallas, vesta, EqAffine, Fp};
-
-use halo2_gadgets::poseidon::{
-    primitives::{self as poseidon, ConstantLength, Spec},
-    Hash, Pow5Chip, Pow5Config,
-};
-use std::convert::TryInto;
-use std::marker::PhantomData;
-
-use criterion::{criterion_group, criterion_main, Criterion};
-use rand::rngs::OsRng;
-
-use halo2_proofs::{
     poly::{
         commitment::ParamsProver,
         ipa::{
@@ -29,8 +14,21 @@ use halo2_proofs::{
         },
         VerificationStrategy,
     },
-    transcript::{TranscriptReadBuffer, TranscriptWriterBuffer},
+    transcript::{
+        Blake2bRead, Blake2bWrite, Challenge255, TranscriptReadBuffer, TranscriptWriterBuffer,
+    },
 };
+use halo2curves::pasta::{pallas, vesta, EqAffine, Fp};
+
+use halo2_gadgets::poseidon::{
+    primitives::{self as poseidon, generate_constants, ConstantLength, Mds, Spec},
+    Hash, Pow5Chip, Pow5Config,
+};
+use std::convert::TryInto;
+use std::marker::PhantomData;
+
+use criterion::{criterion_group, criterion_main, Criterion};
+use rand::rngs::OsRng;
 
 #[derive(Clone, Copy)]
 struct HashCircuit<S, const WIDTH: usize, const RATE: usize, const L: usize>
@@ -38,15 +36,13 @@ where
     S: Spec<Fp, WIDTH, RATE> + Clone + Copy,
 {
     message: Value<[Fp; L]>,
-    // For the purpose of this test, witness the result.
-    // TODO: Move this into an instance column.
-    output: Value<Fp>,
     _spec: PhantomData<S>,
 }
 
 #[derive(Debug, Clone)]
 struct MyConfig<const WIDTH: usize, const RATE: usize, const L: usize> {
     input: [Column<Advice>; L],
+    expected: Column<Instance>,
     poseidon_config: Pow5Config<Fp, WIDTH, RATE>,
 }
 
@@ -57,17 +53,20 @@ where
 {
     type Config = MyConfig<WIDTH, RATE, L>;
     type FloorPlanner = SimpleFloorPlanner;
+    #[cfg(feature = "circuit-params")]
+    type Params = ();
 
     fn without_witnesses(&self) -> Self {
         Self {
             message: Value::unknown(),
-            output: Value::unknown(),
             _spec: PhantomData,
         }
     }
 
     fn configure(meta: &mut ConstraintSystem<Fp>) -> Self::Config {
         let state = (0..WIDTH).map(|_| meta.advice_column()).collect::<Vec<_>>();
+        let expected = meta.instance_column();
+        meta.enable_equality(expected);
         let partial_sbox = meta.advice_column();
 
         let rc_a = (0..WIDTH).map(|_| meta.fixed_column()).collect::<Vec<_>>();
@@ -77,6 +76,7 @@ where
 
         Self::Config {
             input: state[..RATE].try_into().unwrap(),
+            expected,
             poseidon_config: Pow5Chip::configure::<S>(
                 meta,
                 state.try_into().unwrap(),
@@ -118,21 +118,14 @@ where
         )?;
         let output = hasher.hash(layouter.namespace(|| "hash"), message)?;
 
-        layouter.assign_region(
-            || "constrain output",
-            |mut region| {
-                let expected_var =
-                    region.assign_advice(|| "load output", config.input[0], 0, || self.output)?;
-                region.constrain_equal(output.cell(), expected_var.cell())
-            },
-        )
+        layouter.constrain_instance(output.cell(), config.expected, 0)
     }
 }
 
 #[derive(Debug, Clone, Copy)]
 struct MySpec<const WIDTH: usize, const RATE: usize>;
 
-impl Spec<Fp, 3, 2> for MySpec<3, 2> {
+impl<const WIDTH: usize, const RATE: usize> Spec<Fp, WIDTH, RATE> for MySpec<WIDTH, RATE> {
     fn full_rounds() -> usize {
         8
     }
@@ -148,45 +141,13 @@ impl Spec<Fp, 3, 2> for MySpec<3, 2> {
     fn secure_mds() -> usize {
         0
     }
-}
 
-impl Spec<Fp, 9, 8> for MySpec<9, 8> {
-    fn full_rounds() -> usize {
-        8
-    }
-
-    fn partial_rounds() -> usize {
-        56
-    }
-
-    fn sbox(val: Fp) -> Fp {
-        val.pow_vartime(&[5])
-    }
-
-    fn secure_mds() -> usize {
-        0
+    fn constants() -> (Vec<[Fp; WIDTH]>, Mds<Fp, WIDTH>, Mds<Fp, WIDTH>) {
+        generate_constants::<_, Self, WIDTH, RATE>()
     }
 }
 
-impl Spec<Fp, 12, 11> for MySpec<12, 11> {
-    fn full_rounds() -> usize {
-        8
-    }
-
-    fn partial_rounds() -> usize {
-        56
-    }
-
-    fn sbox(val: Fp) -> Fp {
-        val.pow_vartime(&[5])
-    }
-
-    fn secure_mds() -> usize {
-        0
-    }
-}
-
-const K: u32 = 6;
+const K: u32 = 7;
 
 fn bench_poseidon<S, const WIDTH: usize, const RATE: usize, const L: usize>(
     name: &str,
@@ -199,7 +160,6 @@ fn bench_poseidon<S, const WIDTH: usize, const RATE: usize, const L: usize>(
 
     let empty_circuit = HashCircuit::<S, WIDTH, RATE, L> {
         message: Value::unknown(),
-        output: Value::unknown(),
         _spec: PhantomData,
     };
 
@@ -211,7 +171,7 @@ fn bench_poseidon<S, const WIDTH: usize, const RATE: usize, const L: usize>(
     let verifier_name = name.to_string() + "-verifier";
 
     let mut rng = OsRng;
-    let message = (0..L)
+    let message: [Fp; L] = (0..L)
         .map(|_| pallas::Base::random(rng))
         .collect::<Vec<_>>()
         .try_into()
@@ -220,19 +180,18 @@ fn bench_poseidon<S, const WIDTH: usize, const RATE: usize, const L: usize>(
 
     let circuit = HashCircuit::<S, WIDTH, RATE, L> {
         message: Value::known(message),
-        output: Value::known(output),
         _spec: PhantomData,
     };
 
     c.bench_function(&prover_name, |b| {
+        // Create a proof
+        let mut transcript = Blake2bWrite::<_, EqAffine, Challenge255<_>>::init(vec![]);
         b.iter(|| {
-            // Create a proof
-            let mut transcript = Blake2bWrite::<_, EqAffine, Challenge255<_>>::init(vec![]);
             create_proof::<IPACommitmentScheme<_>, ProverIPA<_>, _, _, _, _>(
                 &params,
                 &pk,
                 &[circuit],
-                &[&[]],
+                &[&[&[output]]],
                 &mut rng,
                 &mut transcript,
             )
@@ -246,7 +205,7 @@ fn bench_poseidon<S, const WIDTH: usize, const RATE: usize, const L: usize>(
         &params,
         &pk,
         &[circuit],
-        &[&[]],
+        &[&[&[output]]],
         &mut rng,
         &mut transcript,
     )
@@ -257,7 +216,14 @@ fn bench_poseidon<S, const WIDTH: usize, const RATE: usize, const L: usize>(
         b.iter(|| {
             let strategy = SingleStrategy::new(&params);
             let mut transcript = Blake2bRead::<_, _, Challenge255<_>>::init(&proof[..]);
-            assert!(verify_proof(&params, pk.get_vk(), strategy, &[&[]], &mut transcript).is_ok());
+            assert!(verify_proof(
+                &params,
+                pk.get_vk(),
+                strategy,
+                &[&[&[output]]],
+                &mut transcript
+            )
+            .is_ok());
         });
     });
 }

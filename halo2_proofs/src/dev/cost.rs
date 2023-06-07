@@ -11,10 +11,10 @@ use ff::{Field, PrimeField};
 use group::prime::PrimeGroup;
 
 use crate::{
-    circuit::Value,
+    circuit::{layouter::SyncDeps, Value},
     plonk::{
-        Advice, Any, Assigned, Assignment, Circuit, Column, ConstraintSystem, Error, Fixed,
-        FloorPlanner, Instance, Selector,
+        Advice, Any, Assigned, Assignment, Challenge, Circuit, Column, ConstraintSystem, Error,
+        Fixed, FloorPlanner, Instance, Selector,
     },
     poly::Rotation,
 };
@@ -45,6 +45,8 @@ pub struct CircuitCost<G: PrimeGroup, ConcreteCircuit: Circuit<G::Scalar>> {
 struct Assembly {
     selectors: Vec<Vec<bool>>,
 }
+
+impl SyncDeps for Assembly {}
 
 impl<F: Field> Assignment<F> for Assembly {
     fn enter_region<NR, N>(&mut self, _: N)
@@ -118,6 +120,18 @@ impl<F: Field> Assignment<F> for Assembly {
         Ok(())
     }
 
+    fn get_challenge(&self, _: Challenge) -> Value<F> {
+        Value::unknown()
+    }
+
+    fn annotate_column<A, AR>(&mut self, _annotation: A, _column: Column<Any>)
+    where
+        A: FnOnce() -> AR,
+        AR: Into<String>,
+    {
+        // Do nothing
+    }
+
     fn push_namespace<NR, N>(&mut self, _: N)
     where
         NR: Into<String>,
@@ -138,6 +152,9 @@ impl<G: PrimeGroup, ConcreteCircuit: Circuit<G::Scalar>> CircuitCost<G, Concrete
     pub fn measure(k: usize, circuit: &ConcreteCircuit) -> Self {
         // Collect the layout details.
         let mut cs = ConstraintSystem::default();
+        #[cfg(feature = "circuit-params")]
+        let config = ConcreteCircuit::configure_with_params(&mut cs, circuit.params());
+        #[cfg(not(feature = "circuit-params"))]
         let config = ConcreteCircuit::configure(&mut cs);
         let mut assembly = Assembly {
             selectors: vec![vec![false; 1 << k]; cs.num_selectors],

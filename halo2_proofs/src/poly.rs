@@ -3,11 +3,14 @@
 //! the committed polynomials at arbitrary points.
 
 use crate::arithmetic::parallelize;
+use crate::helpers::SerdePrimeField;
 use crate::plonk::Assigned;
+use crate::SerdeFormat;
 
+use ff::PrimeField;
 use group::ff::{BatchInvert, Field};
-use halo2curves::FieldExt;
 use std::fmt::Debug;
+use std::io;
 use std::marker::PhantomData;
 use std::ops::{Add, Deref, DerefMut, Index, IndexMut, Mul, RangeFrom, RangeFull, Sub};
 
@@ -143,7 +146,37 @@ impl<F, B> Polynomial<F, B> {
     }
 }
 
-pub(crate) fn batch_invert_assigned<F: FieldExt>(
+impl<F: SerdePrimeField, B> Polynomial<F, B> {
+    /// Reads polynomial from buffer using `SerdePrimeField::read`.  
+    pub(crate) fn read<R: io::Read>(reader: &mut R, format: SerdeFormat) -> io::Result<Self> {
+        let mut poly_len = [0u8; 4];
+        reader.read_exact(&mut poly_len)?;
+        let poly_len = u32::from_be_bytes(poly_len);
+
+        (0..poly_len)
+            .map(|_| F::read(reader, format))
+            .collect::<io::Result<Vec<_>>>()
+            .map(|values| Self {
+                values,
+                _marker: PhantomData,
+            })
+    }
+
+    /// Writes polynomial to buffer using `SerdePrimeField::write`.  
+    pub(crate) fn write<W: io::Write>(
+        &self,
+        writer: &mut W,
+        format: SerdeFormat,
+    ) -> io::Result<()> {
+        writer.write_all(&(self.values.len() as u32).to_be_bytes())?;
+        for value in self.values.iter() {
+            value.write(writer, format)?;
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn batch_invert_assigned<F: Field>(
     assigned: Vec<Polynomial<Assigned<F>, LagrangeCoeff>>,
 ) -> Vec<Polynomial<F, LagrangeCoeff>> {
     let mut assigned_denominators: Vec<_> = assigned
@@ -168,9 +201,7 @@ pub(crate) fn batch_invert_assigned<F: FieldExt>(
     assigned
         .iter()
         .zip(assigned_denominators.into_iter())
-        .map(|(poly, inv_denoms)| {
-            poly.invert(inv_denoms.into_iter().map(|d| d.unwrap_or_else(F::one)))
-        })
+        .map(|(poly, inv_denoms)| poly.invert(inv_denoms.into_iter().map(|d| d.unwrap_or(F::ONE))))
         .collect()
 }
 
@@ -240,13 +271,13 @@ impl<F: Field, B: Basis> Mul<F> for Polynomial<F, B> {
     type Output = Polynomial<F, B>;
 
     fn mul(mut self, rhs: F) -> Polynomial<F, B> {
-        if rhs == F::zero() {
+        if rhs == F::ZERO {
             return Polynomial {
-                values: vec![F::zero(); self.len()],
+                values: vec![F::ZERO; self.len()],
                 _marker: PhantomData,
             };
         }
-        if rhs == F::one() {
+        if rhs == F::ONE {
             return self;
         }
 

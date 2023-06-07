@@ -9,12 +9,20 @@ use ff::Field;
 use super::{Cell, RegionIndex, Value};
 use crate::plonk::{Advice, Any, Assigned, Column, Error, Fixed, Instance, Selector, TableColumn};
 
+/// Intermediate trait requirements for [`RegionLayouter`] when thread-safe regions are enabled.
+#[cfg(feature = "thread-safe-region")]
+pub trait SyncDeps: Send + Sync {}
+
+/// Intermediate trait requirements for [`RegionLayouter`].
+#[cfg(not(feature = "thread-safe-region"))]
+pub trait SyncDeps {}
+
 /// Helper trait for implementing a custom [`Layouter`].
 ///
 /// This trait is used for implementing region assignments:
 ///
 /// ```ignore
-/// impl<'a, F: FieldExt, C: Chip<F>, CS: Assignment<F> + 'a> Layouter<C> for MyLayouter<'a, C, CS> {
+/// impl<'a, F: Field, C: Chip<F>, CS: Assignment<F> + 'a> Layouter<C> for MyLayouter<'a, C, CS> {
 ///     fn assign_region(
 ///         &mut self,
 ///         assignment: impl FnOnce(Region<'_, F, C>) -> Result<(), Error>,
@@ -39,7 +47,7 @@ use crate::plonk::{Advice, Any, Assigned, Column, Error, Fixed, Instance, Select
 /// `Chip::Config`).
 ///
 /// [`Layouter`]: super::Layouter
-pub trait RegionLayouter<F: Field>: fmt::Debug {
+pub trait RegionLayouter<F: Field>: fmt::Debug + SyncDeps {
     /// Enables a selector at the given offset.
     fn enable_selector<'v>(
         &'v mut self,
@@ -47,6 +55,16 @@ pub trait RegionLayouter<F: Field>: fmt::Debug {
         selector: &Selector,
         offset: usize,
     ) -> Result<(), Error>;
+
+    /// Allows the circuit implementor to name/annotate a Column within a Region context.
+    ///
+    /// This is useful in order to improve the amount of information that `prover.verify()`
+    /// and `prover.assert_satisfied()` can provide.
+    fn name_column<'v>(
+        &'v mut self,
+        annotation: &'v (dyn Fn() -> String + 'v),
+        column: Column<Any>,
+    );
 
     /// Assign an advice column value (witness)
     fn assign_advice<'v>(
@@ -130,6 +148,8 @@ pub struct RegionShape {
     pub(super) columns: HashSet<RegionColumn>,
     pub(super) row_count: usize,
 }
+
+impl SyncDeps for RegionShape {}
 
 /// The virtual column involved in a region. This includes concrete columns,
 /// as well as selectors that are not concrete columns at this stage.
@@ -273,6 +293,14 @@ impl<F: Field> RegionLayouter<F> for RegionShape {
             row_offset: offset,
             column: column.into(),
         })
+    }
+
+    fn name_column<'v>(
+        &'v mut self,
+        _annotation: &'v (dyn Fn() -> String + 'v),
+        _column: Column<Any>,
+    ) {
+        // Do nothing
     }
 
     fn constrain_constant(&mut self, _cell: Cell, _constant: Assigned<F>) -> Result<(), Error> {

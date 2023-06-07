@@ -1,12 +1,13 @@
 use crate::arithmetic::{
-    best_fft, best_multiexp, g_to_lagrange, parallelize, CurveAffine, CurveExt, FieldExt, Group,
+    best_fft, best_multiexp, g_to_lagrange, parallelize, CurveAffine, CurveExt,
 };
-use crate::helpers::CurveRead;
+use crate::helpers::SerdeCurveAffine;
 use crate::poly::commitment::{Blind, CommitmentScheme, Params, ParamsProver, ParamsVerifier, MSM};
 use crate::poly::{Coeff, LagrangeCoeff, Polynomial};
+use crate::SerdeFormat;
 
 use ff::{Field, PrimeField};
-use group::{prime::PrimeCurveAffine, Curve, Group as _};
+use group::{prime::PrimeCurveAffine, Curve, Group};
 use halo2curves::pairing::Engine;
 use rand_core::{OsRng, RngCore};
 use std::fmt::Debug;
@@ -34,7 +35,12 @@ pub struct KZGCommitmentScheme<E: Engine> {
     _marker: PhantomData<E>,
 }
 
-impl<E: Engine + Debug> CommitmentScheme for KZGCommitmentScheme<E> {
+impl<E: Engine + Debug> CommitmentScheme for KZGCommitmentScheme<E>
+where
+    E::Scalar: PrimeField,
+    E::G1Affine: SerdeCurveAffine,
+    E::G2Affine: SerdeCurveAffine,
+{
     type Scalar = E::Scalar;
     type Curve = E::G1Affine;
 
@@ -50,7 +56,10 @@ impl<E: Engine + Debug> CommitmentScheme for KZGCommitmentScheme<E> {
     }
 }
 
-impl<E: Engine + Debug> ParamsKZG<E> {
+impl<E: Engine + Debug> ParamsKZG<E>
+where
+    E::Scalar: PrimeField,
+{
     /// Initializes parameters for the curve, draws toxic secret from given rng.
     /// MUST NOT be used in production.
     pub fn setup<R: RngCore>(k: u32, rng: R) -> Self {
@@ -63,7 +72,7 @@ impl<E: Engine + Debug> ParamsKZG<E> {
         let g1 = E::G1Affine::generator();
         let s = <E::Scalar>::random(rng);
 
-        let mut g_projective = vec![E::G1::group_zero(); n as usize];
+        let mut g_projective = vec![E::G1::identity(); n as usize];
         parallelize(&mut g_projective, |g, start| {
             let mut current_g: E::G1 = g1.into();
             current_g *= s.pow_vartime(&[start as u64]);
@@ -81,14 +90,14 @@ impl<E: Engine + Debug> ParamsKZG<E> {
             g
         };
 
-        let mut g_lagrange_projective = vec![E::G1::group_zero(); n as usize];
+        let mut g_lagrange_projective = vec![E::G1::identity(); n as usize];
         let mut root = E::Scalar::ROOT_OF_UNITY_INV.invert().unwrap();
         for _ in k..E::Scalar::S {
             root = root.square();
         }
         let n_inv = Option::<E::Scalar>::from(E::Scalar::from(n).invert())
             .expect("inversion should be ok for n = 1<<k");
-        let multiplier = (s.pow_vartime(&[n as u64]) - E::Scalar::one()) * n_inv;
+        let multiplier = (s.pow_vartime(&[n as u64]) - E::Scalar::ONE) * n_inv;
         parallelize(&mut g_lagrange_projective, |g, start| {
             for (idx, g) in g.iter_mut().enumerate() {
                 let offset = start + idx;
@@ -123,6 +132,30 @@ impl<E: Engine + Debug> ParamsKZG<E> {
         }
     }
 
+    /// Initializes parameters for the curve through existing parameters
+    /// k, g, g_lagrange (optional), g2, s_g2
+    pub fn from_parts(
+        &self,
+        k: u32,
+        g: Vec<E::G1Affine>,
+        g_lagrange: Option<Vec<E::G1Affine>>,
+        g2: E::G2Affine,
+        s_g2: E::G2Affine,
+    ) -> Self {
+        Self {
+            k,
+            n: 1 << k,
+            g_lagrange: if let Some(g_l) = g_lagrange {
+                g_l
+            } else {
+                g_to_lagrange(g.iter().map(PrimeCurveAffine::to_curve).collect(), k)
+            },
+            g,
+            g2,
+            s_g2,
+        }
+    }
+
     /// Returns gernerator on G2
     pub fn g2(&self) -> E::G2Affine {
         self.g2
@@ -132,6 +165,111 @@ impl<E: Engine + Debug> ParamsKZG<E> {
     pub fn s_g2(&self) -> E::G2Affine {
         self.s_g2
     }
+
+    /// Writes parameters to buffer
+    pub fn write_custom<W: io::Write>(&self, writer: &mut W, format: SerdeFormat) -> io::Result<()>
+    where
+        E::G1Affine: SerdeCurveAffine,
+        E::G2Affine: SerdeCurveAffine,
+    {
+        writer.write_all(&self.k.to_le_bytes())?;
+        for el in self.g.iter() {
+            el.write(writer, format)?;
+        }
+        for el in self.g_lagrange.iter() {
+            el.write(writer, format)?;
+        }
+        self.g2.write(writer, format)?;
+        self.s_g2.write(writer, format)?;
+        Ok(())
+    }
+
+    /// Reads params from a buffer.
+    pub fn read_custom<R: io::Read>(reader: &mut R, format: SerdeFormat) -> io::Result<Self>
+    where
+        E::G1Affine: SerdeCurveAffine,
+        E::G2Affine: SerdeCurveAffine,
+    {
+        let mut k = [0u8; 4];
+        reader.read_exact(&mut k[..])?;
+        let k = u32::from_le_bytes(k);
+        let n = 1 << k;
+
+        let (g, g_lagrange) = match format {
+            SerdeFormat::Processed => {
+                use group::GroupEncoding;
+                let load_points_from_file_parallelly =
+                    |reader: &mut R| -> io::Result<Vec<Option<E::G1Affine>>> {
+                        let mut points_compressed =
+                            vec![<<E as Engine>::G1Affine as GroupEncoding>::Repr::default(); n];
+                        for points_compressed in points_compressed.iter_mut() {
+                            reader.read_exact((*points_compressed).as_mut())?;
+                        }
+
+                        let mut points = vec![Option::<E::G1Affine>::None; n];
+                        parallelize(&mut points, |points, chunks| {
+                            for (i, point) in points.iter_mut().enumerate() {
+                                *point = Option::from(E::G1Affine::from_bytes(
+                                    &points_compressed[chunks + i],
+                                ));
+                            }
+                        });
+                        Ok(points)
+                    };
+
+                let g = load_points_from_file_parallelly(reader)?;
+                let g: Vec<<E as Engine>::G1Affine> = g
+                    .iter()
+                    .map(|point| {
+                        point.ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::Other, "invalid point encoding")
+                        })
+                    })
+                    .collect::<Result<_, _>>()?;
+                let g_lagrange = load_points_from_file_parallelly(reader)?;
+                let g_lagrange: Vec<<E as Engine>::G1Affine> = g_lagrange
+                    .iter()
+                    .map(|point| {
+                        point.ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::Other, "invalid point encoding")
+                        })
+                    })
+                    .collect::<Result<_, _>>()?;
+                (g, g_lagrange)
+            }
+            SerdeFormat::RawBytes => {
+                let g = (0..n)
+                    .map(|_| <E::G1Affine as SerdeCurveAffine>::read(reader, format))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let g_lagrange = (0..n)
+                    .map(|_| <E::G1Affine as SerdeCurveAffine>::read(reader, format))
+                    .collect::<Result<Vec<_>, _>>()?;
+                (g, g_lagrange)
+            }
+            SerdeFormat::RawBytesUnchecked => {
+                // avoid try branching for performance
+                let g = (0..n)
+                    .map(|_| <E::G1Affine as SerdeCurveAffine>::read(reader, format).unwrap())
+                    .collect::<Vec<_>>();
+                let g_lagrange = (0..n)
+                    .map(|_| <E::G1Affine as SerdeCurveAffine>::read(reader, format).unwrap())
+                    .collect::<Vec<_>>();
+                (g, g_lagrange)
+            }
+        };
+
+        let g2 = E::G2Affine::read(reader, format)?;
+        let s_g2 = E::G2Affine::read(reader, format)?;
+
+        Ok(Self {
+            k,
+            n: n as u64,
+            g,
+            g_lagrange,
+            g2,
+            s_g2,
+        })
+    }
 }
 
 // TODO: see the issue at https://github.com/appliedzkp/halo2/issues/45
@@ -139,7 +277,12 @@ impl<E: Engine + Debug> ParamsKZG<E> {
 /// KZG multi-open verification parameters
 pub type ParamsVerifierKZG<C> = ParamsKZG<C>;
 
-impl<'params, E: Engine + Debug> Params<'params, E::G1Affine> for ParamsKZG<E> {
+impl<'params, E: Engine + Debug> Params<'params, E::G1Affine> for ParamsKZG<E>
+where
+    E::Scalar: PrimeField,
+    E::G1Affine: SerdeCurveAffine,
+    E::G2Affine: SerdeCurveAffine,
+{
     type MSM = MSMKZG<E>;
 
     fn k(&self) -> u32 {
@@ -179,79 +322,29 @@ impl<'params, E: Engine + Debug> Params<'params, E::G1Affine> for ParamsKZG<E> {
 
     /// Writes params to a buffer.
     fn write<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
-        use group::GroupEncoding;
-        writer.write_all(&self.k.to_le_bytes())?;
-        for el in self.g.iter() {
-            writer.write_all(el.to_bytes().as_ref())?;
-        }
-        for el in self.g_lagrange.iter() {
-            writer.write_all(el.to_bytes().as_ref())?;
-        }
-        writer.write_all(self.g2.to_bytes().as_ref())?;
-        writer.write_all(self.s_g2.to_bytes().as_ref())?;
-        Ok(())
+        self.write_custom(writer, SerdeFormat::RawBytes)
     }
 
     /// Reads params from a buffer.
     fn read<R: io::Read>(reader: &mut R) -> io::Result<Self> {
-        use group::GroupEncoding;
-
-        let mut k = [0u8; 4];
-        reader.read_exact(&mut k[..])?;
-        let k = u32::from_le_bytes(k);
-        let n = 1 << k;
-
-        let load_points_from_file_parallelly =
-            |reader: &mut R| -> io::Result<Vec<Option<E::G1Affine>>> {
-                let mut points_compressed =
-                    vec![<<E as Engine>::G1Affine as GroupEncoding>::Repr::default(); n];
-                for points_compressed in points_compressed.iter_mut() {
-                    reader.read_exact((*points_compressed).as_mut())?;
-                }
-
-                let mut points = vec![Option::<E::G1Affine>::None; n];
-                parallelize(&mut points, |points, chunks| {
-                    for (i, point) in points.iter_mut().enumerate() {
-                        *point =
-                            Option::from(E::G1Affine::from_bytes(&points_compressed[chunks + i]));
-                    }
-                });
-                Ok(points)
-            };
-
-        let g = load_points_from_file_parallelly(reader)?;
-        let g: Vec<<E as Engine>::G1Affine> = g
-            .iter()
-            .map(|point| {
-                point.ok_or_else(|| io::Error::new(io::ErrorKind::Other, "invalid point encoding"))
-            })
-            .collect::<Result<_, _>>()?;
-
-        let g_lagrange = load_points_from_file_parallelly(reader)?;
-        let g_lagrange: Vec<<E as Engine>::G1Affine> = g_lagrange
-            .iter()
-            .map(|point| {
-                point.ok_or_else(|| io::Error::new(io::ErrorKind::Other, "invalid point encoding"))
-            })
-            .collect::<Result<_, _>>()?;
-
-        let g2 = E::G2Affine::read(reader)?;
-        let s_g2 = E::G2Affine::read(reader)?;
-
-        Ok(Self {
-            k,
-            n: n as u64,
-            g,
-            g_lagrange,
-            g2,
-            s_g2,
-        })
+        Self::read_custom(reader, SerdeFormat::RawBytes)
     }
 }
 
-impl<'params, E: Engine + Debug> ParamsVerifier<'params, E::G1Affine> for ParamsKZG<E> {}
+impl<'params, E: Engine + Debug> ParamsVerifier<'params, E::G1Affine> for ParamsKZG<E>
+where
+    E::Scalar: PrimeField,
+    E::G1Affine: SerdeCurveAffine,
+    E::G2Affine: SerdeCurveAffine,
+{
+}
 
-impl<'params, E: Engine + Debug> ParamsProver<'params, E::G1Affine> for ParamsKZG<E> {
+impl<'params, E: Engine + Debug> ParamsProver<'params, E::G1Affine> for ParamsKZG<E>
+where
+    E::Scalar: PrimeField,
+    E::G1Affine: SerdeCurveAffine,
+    E::G2Affine: SerdeCurveAffine,
+{
     type ParamsVerifier = ParamsVerifierKZG<E>;
 
     fn verifier_params(&'params self) -> &'params Self::ParamsVerifier {
@@ -278,11 +371,7 @@ impl<'params, E: Engine + Debug> ParamsProver<'params, E::G1Affine> for ParamsKZ
 
 #[cfg(test)]
 mod test {
-
-    use crate::arithmetic::{
-        best_fft, best_multiexp, parallelize, CurveAffine, CurveExt, FieldExt, Group,
-    };
-    use crate::helpers::CurveRead;
+    use crate::arithmetic::{best_fft, best_multiexp, parallelize, CurveAffine, CurveExt};
     use crate::poly::commitment::ParamsProver;
     use crate::poly::commitment::{Blind, CommitmentScheme, Params, MSM};
     use crate::poly::kzg::commitment::{ParamsKZG, ParamsVerifierKZG};
@@ -291,7 +380,7 @@ mod test {
     use crate::poly::{Coeff, LagrangeCoeff, Polynomial};
 
     use ff::{Field, PrimeField};
-    use group::{prime::PrimeCurveAffine, Curve, Group as _};
+    use group::{prime::PrimeCurveAffine, Curve, Group};
     use halo2curves::bn256::G1Affine;
     use std::marker::PhantomData;
     use std::ops::{Add, AddAssign, Mul, MulAssign};
@@ -331,7 +420,7 @@ mod test {
         use rand_core::OsRng;
 
         use super::super::commitment::{Blind, Params};
-        use crate::arithmetic::{eval_polynomial, FieldExt};
+        use crate::arithmetic::eval_polynomial;
         use crate::halo2curves::bn256::{Bn256, Fr};
         use crate::poly::EvaluationDomain;
 
