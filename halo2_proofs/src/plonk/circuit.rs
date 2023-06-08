@@ -1143,7 +1143,8 @@ pub struct ConstraintSystem<F: Field> {
     pub(crate) num_fixed_columns: usize,
     pub(crate) num_advice_columns: usize,
     pub(crate) num_instance_columns: usize,
-    pub(crate) num_selectors: usize,
+    /// Visibility changed for analyzer
+    pub num_selectors: usize,
 
     /// This is a cached vector that maps virtual selectors to the concrete
     /// fixed column that they were compressed into. This is just used by dev
